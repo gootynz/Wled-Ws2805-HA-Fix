@@ -1,0 +1,8 @@
+{
+  "name": "WLED WS2805 Card",
+  "description": "Lovelace card for WS2805 RGBWW LED strips via WLED. Fixes broken HA light integration.",
+  "content_in_root": true,
+  "filename": "wled-card.js",
+  "homeassistant": "2023.1.0",
+  "version": "1.0.0"
+}
