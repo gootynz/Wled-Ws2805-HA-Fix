@@ -32,7 +32,7 @@ This is a known, long-standing issue that remains unfixed while HA continues to 
 1. Open HACS in Home Assistant
 2. Go to **Frontend**
 3. Click the three dots menu → **Custom repositories**
-4. Add `https://github.com/gootynz/wled-card` as a **Lovelace** repository
+4. Add `https://github.com/yourusername/wled-card` as a **Lovelace** repository
 5. Install **WLED Card**
 6. Refresh your browser
 
@@ -106,7 +106,10 @@ The card background tints to the current light color. Five styles are available 
 
 ---
 
+![WLED Card](screenshots/ws2805-wled-js-standard.JPG)
+
+![WLED Card](screenshots/ws2805-wled-js-effects-active.JPG)
+
+![WLED Card](screenshots/ws2805-wled-js-bg-bottom.JPG)
 ## License
-
 MIT
-
