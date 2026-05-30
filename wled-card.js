@@ -1,30 +1,40 @@
 /**
- * wled-card.js — v1.1
+ * wled-card.js — v1.4
  * Custom Lovelace card for WS2805 RGBWW LED strips via WLED.
+ * Designed for Home Assistant Lovelace with optional direct WLED REST API control.
  *
- * Why this exists:
- * HA's built-in light integration does not correctly handle WS2805 5-channel
- * RGBWW LEDs. Colors break, white channels are mangled, every standard card
- * fails. This card bypasses the broken integration — routing on/off/brightness/
- * color through HA callService to keep automations working, while talking
- * directly to WLED REST for effects, speed and intensity.
+ * Configuration (in Lovelace YAML):
+ *   type: custom:wled-card
+ *   name: "Strip Name"          # display label
+ *   entity: light.my_wled       # HA light entity (optional)
+ *   host: http://wled.local      # direct WLED IP or FQDN (optional, required for effects/speed/intensity)
  *
- * v1.1 changes:
- * - Scrollable inline effects list (no popup dropdown)
- * - State polling every 30s (stays in sync with external changes)
- * - Expanded preset list (primaries, secondaries, multi-color combos)
- * - Background color on load bulletproofed with retry
+ * Note: `host` must be reachable from the browser, not from HA.
+ *   - On LAN: use local IP (e.g. http://192.168.1.x) or mDNS (http://wled.local)
+ *   - Remote access (via Nabu Casa / Cloudflare Tunnel etc): LAN IP will fail.
+ *     Use a FQDN that resolves externally, or omit `host` and use `entity` only.
+ *     Without `host`, effects/speed/intensity controls are unavailable.
  *
- * License: MIT
+ * v1.4 changes:
+ *   - Effects list sorted A-Z
+ *   - Pager redesigned: dedicated prev/next nav rows — all items selectable on every page
+ *   - "Set Solid Colour" quick button added above effects list
+ *   - Colour circle indicator removed from quick-colour row
+ *   - Brightness slider fix: includes current brightness when toggling power on (host mode)
+ *
+ * v1.3 changes:
+ *   - Click-to-page list for both presets and effects (no scrollbar, no focus stealing)
+ *   - Polling every 30s to stay in sync with external changes
+ *   - Background colour tint on load bulletproofed
+ *
+ * v1.2 changes:
+ *   - Initial paged list implementation
  */
 
-const POLL_INTERVAL = 30000; // ms — how often to sync state from WLED
-const ITEM_H = 28;           // px — height of each effect list row
-const MAX_VISIBLE = 6;       // number of effect rows visible before scrolling
+const PAGE_SIZE = 5;    // items visible per page
+const ITEM_H   = 28;   // px per row
+const POLL_MS  = 30000;
 
-// ─── Color presets ────────────────────────────────────────────────────────────
-// Single color: col: [[r,g,b]]
-// Multi-color:  col: [[r,g,b],[r,g,b],[r,g,b]] — used by effects with palettes
 const DEFAULT_PRESETS = [
   // Primaries
   { name: 'Red',          col: [[255,0,0]] },
@@ -59,8 +69,6 @@ const DEFAULT_PRESETS = [
   { name: 'Candy',        col: [[255,0,128],[255,255,0],[0,255,255]] },
 ];
 
-// ─── Quick pick buttons ───────────────────────────────────────────────────────
-// Tap to set color and power on simultaneously — no popup
 const QUICK = [
   { title: 'Red',        col: [[255,0,0]],     bg: '#ff0000' },
   { title: 'Green',      col: [[0,255,0]],     bg: '#00ff00' },
@@ -81,10 +89,13 @@ class WledCard extends HTMLElement {
     this._host = null;
     this._initialized = false;
     this._pollTimer = null;
+    this._effects = [];
+    this._fxPage = 0;
+    this._presetPage = 0;
+    this._selectedFx = 0;
+    this._selectedPreset = null;
   }
 
-  // ─── HA state sync ────────────────────────────────────────────────────────
-  // Fires on every HA state change — keeps card in sync with automations
   set hass(hass) {
     this._hass = hass;
     if (!this._initialized || !this._entity) return;
@@ -101,7 +112,7 @@ class WledCard extends HTMLElement {
     this._presets = (config.presets && config.presets.length)
       ? config.presets.map(p => ({
           name: p.name,
-          col: Array.isArray(p.rgb && p.rgb[0]) ? p.rgb : p.col || [p.rgb || [255,255,255]]
+          col: p.col ? p.col : (Array.isArray(p.rgb && p.rgb[0]) ? p.rgb : [p.rgb || [255,255,255]])
         }))
       : DEFAULT_PRESETS;
     this._render();
@@ -113,15 +124,12 @@ class WledCard extends HTMLElement {
   }
 
   disconnectedCallback() {
-    // Clean up poll timer when card is removed
     clearInterval(this._pollTimer);
   }
 
-  // ─── Polling ──────────────────────────────────────────────────────────────
-  // Syncs WLED state every 30s so card stays current after external changes
   _startPolling() {
     clearInterval(this._pollTimer);
-    this._pollTimer = setInterval(() => this._pollWled(), POLL_INTERVAL);
+    this._pollTimer = setInterval(() => this._pollWled(), POLL_MS);
   }
 
   async _pollWled() {
@@ -135,17 +143,19 @@ class WledCard extends HTMLElement {
       const seg = state.seg?.[0];
       if (seg?.col?.[0]) {
         const [r,g,b] = seg.col[0];
-        sr.getElementById('cur-color').style.background = this._toHex(seg.col[0]);
         this._setCardBg(r,g,b);
       }
       if (seg?.sx !== undefined) { sr.getElementById('sx').value = seg.sx; sr.getElementById('sx-val').textContent = seg.sx; }
       if (seg?.ix !== undefined) { sr.getElementById('ix').value = seg.ix; sr.getElementById('ix-val').textContent = seg.ix; }
-      // Highlight current effect in list
-      if (seg?.fx !== undefined) this._highlightEffect(seg.fx);
-    } catch(e) { /* silent fail on poll */ }
+      if (seg?.fx !== undefined && seg.fx !== this._selectedFx) {
+        this._selectedFx = seg.fx;
+        const si = this._effects.findIndex(e => e.id === seg.fx);
+        if (si >= 0) this._fxPage = Math.floor(si / PAGE_SIZE);
+        this._renderFxPage();
+      }
+    } catch(e) { /* silent */ }
   }
 
-  // ─── Sync UI from HA state ────────────────────────────────────────────────
   _syncFromState(state) {
     const sr = this.shadowRoot;
     const on = state.state === 'on';
@@ -157,61 +167,44 @@ class WledCard extends HTMLElement {
     }
     if (on && state.attributes.rgb_color) {
       const [r,g,b] = state.attributes.rgb_color;
-      sr.getElementById('cur-color').style.background = this._toHex([r,g,b]);
       this._setCardBg(r,g,b);
     }
     sr.getElementById('status').textContent = on ? 'On' : 'Off';
     sr.getElementById('status').className = 'status';
   }
 
-  // ─── Helpers ──────────────────────────────────────────────────────────────
   _toHex(rgb) {
     return '#' + rgb.map(x => Math.round(Math.max(0,Math.min(255,x))).toString(16).padStart(2,'0')).join('');
   }
 
-  // ─── Card background gradient ─────────────────────────────────────────────
-  // Tints card background to reflect current light color.
-  // Uncomment preferred style — only one active at a time.
   _setCardBg(r,g,b) {
     const el = this.shadowRoot.getElementById('card-inner');
     if (!el) return;
-
     // Option 1 — subtle full card tint
     // el.style.background = `linear-gradient(135deg, rgba(${r},${g},${b},0.18) 0%, rgba(${r},${g},${b},0.05) 100%)`;
-
     // Option 2 — strong left fade
     // el.style.background = `linear-gradient(90deg, rgba(${r},${g},${b},0.98) 0%, rgba(${r},${g},${b},0.05) 100%)`;
-
     // Option 3 — strong right fade
     // el.style.background = `linear-gradient(90deg, rgba(${r},${g},${b},0.05) 0%, rgba(${r},${g},${b},0.98) 100%)`;
-
     // Option 4 — right quarter only
-    // el.style.background = `linear-gradient(90deg, rgba(${r},${g},${b},0.05) 0%, rgba(${r},${g},${b},0.05) 75%, rgba(${r},${g},${b},0.95) 100%)`;
-
+     el.style.background = `linear-gradient(180deg, rgba(${r},${g},${b},0.05) 0%, rgba(${r},${g},${b},0.05) 75%, rgba(${r},${g},${b},0.95) 100%)`;
     // Option 5 — radial vignette glow from edges (default)
-    el.style.background = `radial-gradient(ellipse at center, rgba(${r},${g},${b},0.0) 40%, rgba(${r},${g},${b},0.95) 100%)`;
+    //el.style.background = `radial-gradient(ellipse at center, rgba(${r},${g},${b},0.0) 40%, rgba(${r},${g},${b},0.95) 100%)`;
   }
 
-  // ─── Set color ────────────────────────────────────────────────────────────
-  // Powers on + sets color in one call — tap quick button or preset
   _setColor(col) {
     const [r,g,b] = col[0];
     const sr = this.shadowRoot;
-    sr.getElementById('cur-color').style.background = this._toHex(col[0]);
     sr.getElementById('pwr').checked = true;
     this._setCardBg(r,g,b);
     if (this._entity && this._hass) {
-      this._hass.callService('light', 'turn_on', {
-        entity_id: this._entity,
-        rgb_color: col[0],
-      });
+      this._hass.callService('light', 'turn_on', { entity_id: this._entity, rgb_color: col[0] });
       this._setStatus('OK');
     } else if (this._host) {
       this._restApi({ on: true, seg: [{ col }] });
     }
   }
 
-  // ─── Generic light call ───────────────────────────────────────────────────
   _callLight(data) {
     if (this._entity && this._hass) {
       if (data.state === false) {
@@ -219,17 +212,25 @@ class WledCard extends HTMLElement {
       } else {
         const svc = { entity_id: this._entity };
         if (data.brightness !== undefined) svc.brightness = data.brightness;
-        if (data.rgb !== undefined) svc.rgb_color = data.rgb;
         this._hass.callService('light', 'turn_on', svc);
       }
       this._setStatus('OK');
     } else if (this._host) {
-      this._restApi(data.state === false ? { on: false } : { on: true, ...data });
+      if (data.state === false) {
+        this._restApi({ on: false });
+      } else {
+        const payload = { on: true };
+        if (data.brightness !== undefined) {
+          payload.bri = data.brightness;
+        } else {
+          const briEl = this.shadowRoot.getElementById('bri');
+          if (briEl) payload.bri = parseInt(briEl.value);
+        }
+        this._restApi(payload);
+      }
     }
   }
 
-  // ─── Direct WLED REST ─────────────────────────────────────────────────────
-  // Effects, speed, intensity — not available via HA light entity
   async _restApi(payload) {
     try {
       const r = await fetch(this._host + '/json/state', {
@@ -239,20 +240,21 @@ class WledCard extends HTMLElement {
       });
       if (!r.ok) throw new Error('HTTP ' + r.status);
       this._setStatus('OK');
-    } catch(e) {
-      this._setStatus(e.message, true);
-    }
+    } catch(e) { this._setStatus(e.message, true); }
   }
 
-  // ─── Load WLED state + effects ────────────────────────────────────────────
   async _loadFromWled() {
     try {
       const [state, info] = await Promise.all([
         fetch(this._host + '/json/state').then(r => r.json()),
         fetch(this._host + '/json').then(r => r.json())
       ]);
-      this._effects = info.effects || [];
-      this._renderEffectList(state.seg?.[0]?.fx ?? 0);
+      this._effects = (info.effects || []).map((name, id) => ({ name, id })).sort((a, b) => a.name.localeCompare(b.name));
+      this._selectedFx = state.seg?.[0]?.fx ?? 0;
+      // jump to page containing current effect (sorted index)
+      const sortedIdx = this._effects.findIndex(e => e.id === this._selectedFx);
+      this._fxPage = Math.floor(Math.max(0, sortedIdx) / PAGE_SIZE);
+      this._renderFxPage();
       if (!this._entity) {
         const sr = this.shadowRoot;
         sr.getElementById('pwr').checked = state.on;
@@ -261,14 +263,11 @@ class WledCard extends HTMLElement {
         const seg = state.seg?.[0];
         if (seg?.col?.[0]) {
           const [r,g,b] = seg.col[0];
-          sr.getElementById('cur-color').style.background = this._toHex(seg.col[0]);
-          // Retry setCardBg to ensure DOM is ready
           setTimeout(() => this._setCardBg(r,g,b), 150);
         }
         if (seg?.sx !== undefined) { sr.getElementById('sx').value = seg.sx; sr.getElementById('sx-val').textContent = seg.sx; }
         if (seg?.ix !== undefined) { sr.getElementById('ix').value = seg.ix; sr.getElementById('ix-val').textContent = seg.ix; }
       } else {
-        // Entity mode — still need bg color on load
         const seg = state.seg?.[0];
         if (seg?.col?.[0]) {
           const [r,g,b] = seg.col[0];
@@ -276,39 +275,109 @@ class WledCard extends HTMLElement {
         }
       }
       this._setStatus('Connected');
-    } catch(e) {
-      this._setStatus('Cannot reach WLED', true);
+    } catch(e) { this._setStatus('Cannot reach WLED', true); }
+  }
+
+  // ── Paged list helpers ──────────────────────────────────────────────────────
+  // Items are shown PAGE_SIZE at a time.
+  // Clicking the LAST visible item advances to the next page (wraps around).
+  // Clicking the FIRST visible item goes back one page (wraps around).
+  // No scrollbar — no focus stealing.
+ 
+  _navRow(label, onClick) {
+    const row = document.createElement('div');
+    row.className = 'list-item';
+    row.style.justifyContent = 'center';
+    row.style.opacity = '0.45';
+    row.style.fontSize = '10px';
+    row.textContent = label;
+    row.addEventListener('click', onClick);
+    return row;
+  }
+
+  _renderPresetPage() {
+    const container = this.shadowRoot.getElementById('preset-list');
+    if (!container) return;
+    container.innerHTML = '';
+    const total = this._presets.length;
+    const start = this._presetPage * PAGE_SIZE;
+    const slice = this._presets.slice(start, start + PAGE_SIZE);
+    let rows = 0;
+
+    if (this._presetPage > 0) {
+      container.appendChild(this._navRow('▲ prev', () => { this._presetPage--; this._renderPresetPage(); }));
+      rows++;
     }
-  }
 
-  // ─── Inline scrollable effect list ───────────────────────────────────────
-  _renderEffectList(curFx = 0) {
-    const list = this.shadowRoot.getElementById('fx-list');
-    if (!list || !this._effects) return;
-    list.innerHTML = '';
-    this._effects.forEach((name, i) => {
+    slice.forEach((p, localIdx) => {
+      const globalIdx = start + localIdx;
+      const isSelected = this._selectedPreset === globalIdx;
       const item = document.createElement('div');
-      item.className = 'list-item' + (i === curFx ? ' selected' : '');
-      item.textContent = name;
-      item.dataset.idx = i;
+      item.className = 'list-item' + (isSelected ? ' selected' : '');
+      const dot = document.createElement('div');
+      dot.className = 'swatch';
+      dot.style.background = this._toHex(p.col[0]);
+      item.appendChild(dot);
+      const lbl = document.createElement('span');
+      lbl.style.flex = '1';
+      lbl.textContent = p.name;
+      item.appendChild(lbl);
       item.addEventListener('click', () => {
-        list.querySelectorAll('.list-item').forEach(el => el.classList.remove('selected'));
+        this._selectedPreset = globalIdx;
+        this.shadowRoot.querySelectorAll('#preset-list .list-item').forEach(el => el.classList.remove('selected'));
         item.classList.add('selected');
-        if (this._host) this._restApi({ seg: [{ fx: i }] });
+        this.shadowRoot.querySelectorAll('.qbtn').forEach(b => b.classList.remove('active'));
+        this._setColor(p.col);
       });
-      list.appendChild(item);
+      container.appendChild(item);
+      rows++;
     });
-    list.style.height = (Math.min(this._effects.length, MAX_VISIBLE) * ITEM_H) + 'px';
-  }
 
-  _highlightEffect(fxIdx) {
-    const list = this.shadowRoot.getElementById('fx-list');
-    if (!list) return;
-    list.querySelectorAll('.list-item').forEach(el => {
-      el.classList.toggle('selected', parseInt(el.dataset.idx) === fxIdx);
+    if (start + PAGE_SIZE < total) {
+      container.appendChild(this._navRow('▼ next', () => { this._presetPage++; this._renderPresetPage(); }));
+      rows++;
+    }
+
+    container.style.height = (rows * ITEM_H) + 'px';
+  }
+  _renderFxPage() {
+    const container = this.shadowRoot.getElementById('fx-list');
+    if (!container || !this._effects.length) return;
+    container.innerHTML = '';
+    const total = this._effects.length;
+    const start = this._fxPage * PAGE_SIZE;
+    const slice = this._effects.slice(start, start + PAGE_SIZE);
+    let rows = 0;
+
+    if (this._fxPage > 0) {
+      container.appendChild(this._navRow('▲ prev', () => { this._fxPage--; this._renderFxPage(); }));
+      rows++;
+    }
+
+    slice.forEach((e, localIdx) => {
+      const isSelected = e.id === this._selectedFx;
+      const item = document.createElement('div');
+      item.className = 'list-item' + (isSelected ? ' selected' : '');
+      const lbl = document.createElement('span');
+      lbl.style.flex = '1';
+      lbl.textContent = e.name;
+      item.appendChild(lbl);
+      item.addEventListener('click', () => {
+        this._selectedFx = e.id;
+        this._renderFxPage();
+        if (this._host) this._restApi({ seg: [{ fx: e.id }] });
+      });
+      container.appendChild(item);
+      rows++;
     });
-  }
 
+    if (start + PAGE_SIZE < total) {
+      container.appendChild(this._navRow('▼ next', () => { this._fxPage++; this._renderFxPage(); }));
+      rows++;
+    }
+
+    container.style.height = (rows * ITEM_H) + 'px';
+  }
   _setStatus(msg, err=false) {
     const s = this.shadowRoot.getElementById('status');
     if (!s) return;
@@ -316,7 +385,6 @@ class WledCard extends HTMLElement {
     s.className = 'status' + (err ? ' err' : '');
   }
 
-  // ─── Render ───────────────────────────────────────────────────────────────
   _render() {
     this.shadowRoot.innerHTML = `
       <style>
@@ -334,80 +402,35 @@ class WledCard extends HTMLElement {
           transition: background 0.6s ease;
           border-radius: var(--ha-card-border-radius, 12px);
         }
-        .header {
-          display: flex; align-items: center;
-          justify-content: space-between; margin-bottom: 16px;
-        }
-        .name {
-          font-size: 14px; font-weight: 600;
-          letter-spacing: 0.04em; text-transform: uppercase; opacity: 0.6;
-        }
+        .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+        .name { font-size: 14px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; opacity: 0.6; }
         .toggle { position: relative; width: 46px; height: 26px; flex-shrink: 0; }
         .toggle input { opacity: 0; width: 0; height: 0; }
-        .knob {
-          position: absolute; inset: 0;
-          background: rgba(255,255,255,0.12);
-          border-radius: 13px; cursor: pointer; transition: background 0.2s;
-        }
+        .knob { position: absolute; inset: 0; background: rgba(255,255,255,0.12); border-radius: 13px; cursor: pointer; transition: background 0.2s; }
         .toggle input:checked + .knob { background: #ff6a00; }
-        .knob:before {
-          content: ''; position: absolute;
-          width: 20px; height: 20px; left: 3px; top: 3px;
-          background: #fff; border-radius: 50%;
-          transition: transform 0.2s; box-shadow: 0 1px 3px rgba(0,0,0,0.4);
-        }
+        .knob:before { content: ''; position: absolute; width: 20px; height: 20px; left: 3px; top: 3px; background: #fff; border-radius: 50%; transition: transform 0.2s; box-shadow: 0 1px 3px rgba(0,0,0,0.4); }
         .toggle input:checked + .knob:before { transform: translateX(20px); }
         .row { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
         .lbl { font-size: 12px; opacity: 0.45; min-width: 72px; letter-spacing: 0.03em; }
         .val { font-size: 12px; min-width: 30px; text-align: right; opacity: 0.7; font-variant-numeric: tabular-nums; }
-        input[type=range] {
-          flex: 1; -webkit-appearance: none;
-          height: 3px; border-radius: 2px;
-          background: rgba(255,255,255,0.15); outline: none; cursor: pointer;
-        }
-        input[type=range]::-webkit-slider-thumb {
-          -webkit-appearance: none; width: 16px; height: 16px;
-          border-radius: 50%; background: #fff; box-shadow: 0 1px 4px rgba(0,0,0,0.5);
-        }
+        input[type=range] { flex: 1; -webkit-appearance: none; height: 3px; border-radius: 2px; background: rgba(255,255,255,0.15); outline: none; cursor: pointer; }
+        input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 16px; height: 16px; border-radius: 50%; background: #fff; box-shadow: 0 1px 4px rgba(0,0,0,0.5); }
         .quick-row { display: flex; gap: 8px; margin-bottom: 12px; }
-        .qbtn {
-          flex: 1; height: 28px; border-radius: 6px;
-          border: 2px solid transparent;
-          cursor: pointer; outline: none;
-          transition: transform 0.1s, border-color 0.15s; font-size: 0;
-        }
+        .qbtn { flex: 1; height: 28px; border-radius: 6px; border: 2px solid transparent; cursor: pointer; outline: none; transition: transform 0.1s, border-color 0.15s; font-size: 0; }
         .qbtn:hover { transform: scale(1.08); }
         .qbtn.active { border-color: #fff; box-shadow: 0 0 6px rgba(255,255,255,0.4); }
-        .cur-color {
-          width: 18px; height: 18px; border-radius: 50%;
-          border: 1px solid rgba(255,255,255,0.2); flex-shrink: 0;
-          transition: background 0.4s;
-        }
-        .divider {
-          border: none; border-top: 1px solid rgba(255,255,255,0.07);
-          margin: 4px 0 12px;
-        }
-        .col-header {
-          font-size: 10px; font-weight: 600; letter-spacing: 0.08em;
-          text-transform: uppercase; opacity: 0.35; margin-bottom: 6px;
-        }
-        .two-col {
-          display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
-          margin-bottom: 12px;
-        }
-        .scroll-list {
-          overflow-y: auto;
+        .divider { border: none; border-top: 1px solid rgba(255,255,255,0.07); margin: 4px 0 12px; }
+        .col-header { font-size: 10px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; opacity: 0.35; margin-bottom: 6px; }
+        .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 12px; }
+        .paged-list {
           border-radius: 8px;
           border: 1px solid rgba(255,255,255,0.08);
           background: rgba(255,255,255,0.03);
-          scrollbar-width: thin;
-          scrollbar-color: rgba(255,255,255,0.15) transparent;
+          overflow: hidden;
         }
-        .scroll-list::-webkit-scrollbar { width: 4px; }
-        .scroll-list::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.15); border-radius: 2px; }
         .list-item {
-          display: flex; align-items: center;
-          padding: 0 10px; height: ${ITEM_H}px;
+          display: flex; align-items: center; gap: 6px;
+          padding: 0 8px; height: ${ITEM_H}px;
           font-size: 12px; cursor: pointer;
           border-bottom: 1px solid rgba(255,255,255,0.04);
           transition: background 0.1s; user-select: none;
@@ -415,28 +438,19 @@ class WledCard extends HTMLElement {
         .list-item:last-child { border-bottom: none; }
         .list-item:hover { background: rgba(255,255,255,0.06); }
         .list-item.selected { background: rgba(255,106,0,0.18); color: #ff6a00; }
-        .preset-swatch {
-          width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0;
-          border: 1px solid rgba(255,255,255,0.2); margin-right: 7px;
-        }
-        .row-with-dot { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
-        .status {
-          font-size: 10px; opacity: 0.3; text-align: right;
-          margin-top: 4px; letter-spacing: 0.05em; min-height: 14px;
-        }
+        .swatch { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; border: 1px solid rgba(255,255,255,0.2); }
+        .page-nav { font-size: 9px; opacity: 0.4; flex-shrink: 0; }
+        .list-item:hover .page-nav { opacity: 0.8; }
+        .status { font-size: 10px; opacity: 0.3; text-align: right; margin-top: 4px; letter-spacing: 0.05em; min-height: 14px; }
         .status.err { opacity: 0.7; color: #ff453a; }
       </style>
 
       <ha-card>
         <div class="card">
           <div class="card-inner" id="card-inner">
-
             <div class="header">
               <span class="name">${this._name}</span>
-              <label class="toggle">
-                <input type="checkbox" id="pwr">
-                <span class="knob"></span>
-              </label>
+              <label class="toggle"><input type="checkbox" id="pwr"><span class="knob"></span></label>
             </div>
 
             <div class="row">
@@ -449,7 +463,6 @@ class WledCard extends HTMLElement {
 
             <div class="quick-row">
               ${QUICK.map((q,i) => `<button class="qbtn" data-idx="${i}" style="background:${q.bg}" title="${q.title}" aria-label="${q.title}"></button>`).join('')}
-              <div class="cur-color" id="cur-color"></div>
             </div>
 
             <hr class="divider">
@@ -457,11 +470,11 @@ class WledCard extends HTMLElement {
             <div class="two-col">
               <div>
                 <div class="col-header">Color Presets</div>
-                <div class="scroll-list" id="preset-list" style="height:${MAX_VISIBLE * ITEM_H}px"></div>
+                <div class="paged-list" id="preset-list"></div>
               </div>
               <div>
-                <div class="col-header">Effects</div>
-                <div class="scroll-list" id="fx-list" style="height:${MAX_VISIBLE * ITEM_H}px">
+                <div class="col-header" style="display:flex;align-items:center;justify-content:space-between;">Effects<button id="solid-btn" style="font-size:9px;padding:1px 6px;border-radius:4px;border:1px solid rgba(255,255,255,0.2);background:rgba(255,255,255,0.08);color:inherit;cursor:pointer;letter-spacing:0.04em;opacity:0.7;">Set Solid Colour</button></div>
+                <div class="paged-list" id="fx-list">
                   <div class="list-item" style="opacity:0.3;cursor:default">Loading…</div>
                 </div>
               </div>
@@ -487,41 +500,20 @@ class WledCard extends HTMLElement {
 
     const sr = this.shadowRoot;
 
-    // Populate preset list with color swatches
-    const presetList = sr.getElementById('preset-list');
-    this._presets.forEach((p, i) => {
-      const item = document.createElement('div');
-      item.className = 'list-item';
-      const dot = document.createElement('div');
-      dot.className = 'preset-swatch';
-      dot.style.background = this._toHex(p.col[0]);
-      item.appendChild(dot);
-      item.appendChild(document.createTextNode(p.name));
-      item.addEventListener('click', () => {
-        presetList.querySelectorAll('.list-item').forEach(el => el.classList.remove('selected'));
-        item.classList.add('selected');
-        sr.querySelectorAll('.qbtn').forEach(b => b.classList.remove('active'));
-        this._setColor(p.col);
-      });
-      presetList.appendChild(item);
-    });
-
-    sr.getElementById('pwr').addEventListener('change', e => {
-      this._callLight({ state: e.target.checked });
-    });
+    sr.getElementById('pwr').addEventListener('change', e => this._callLight({ state: e.target.checked }));
 
     sr.getElementById('bri').addEventListener('input', e => {
       sr.getElementById('bri-val').textContent = e.target.value;
       clearTimeout(this._debounce.bri);
-      this._debounce.bri = setTimeout(() =>
-        this._callLight({ brightness: parseInt(e.target.value) }), 250);
+      this._debounce.bri = setTimeout(() => this._callLight({ brightness: parseInt(e.target.value) }), 250);
     });
 
     sr.querySelectorAll('.qbtn').forEach(btn => {
       btn.addEventListener('click', () => {
         sr.querySelectorAll('.qbtn').forEach(b => b.classList.remove('active'));
         btn.classList.add('active');
-        presetList.querySelectorAll('.list-item').forEach(el => el.classList.remove('selected'));
+        this._selectedPreset = null;
+        this._renderPresetPage();
         this._setColor(QUICK[parseInt(btn.dataset.idx)].col);
       });
     });
@@ -529,18 +521,26 @@ class WledCard extends HTMLElement {
     sr.getElementById('sx').addEventListener('input', e => {
       sr.getElementById('sx-val').textContent = e.target.value;
       clearTimeout(this._debounce.sx);
-      this._debounce.sx = setTimeout(() => {
-        if (this._host) this._restApi({ seg: [{ sx: parseInt(e.target.value) }] });
-      }, 250);
+      this._debounce.sx = setTimeout(() => { if (this._host) this._restApi({ seg: [{ sx: parseInt(e.target.value) }] }); }, 250);
     });
 
     sr.getElementById('ix').addEventListener('input', e => {
       sr.getElementById('ix-val').textContent = e.target.value;
       clearTimeout(this._debounce.ix);
-      this._debounce.ix = setTimeout(() => {
-        if (this._host) this._restApi({ seg: [{ ix: parseInt(e.target.value) }] });
-      }, 250);
+      this._debounce.ix = setTimeout(() => { if (this._host) this._restApi({ seg: [{ ix: parseInt(e.target.value) }] }); }, 250);
     });
+
+    sr.getElementById('solid-btn').addEventListener('click', () => {
+      this._selectedFx = 0;
+      this._fxPage = 0;
+      this._renderFxPage();
+      if (this._host) this._restApi({ seg: [{ fx: 0 }] });
+      if (this._entity && this._hass) this._hass.callService('light', 'turn_on', { entity_id: this._entity, effect: 'Solid' });
+      this._setStatus('Solid');
+    });
+
+    // render initial preset page
+    this._renderPresetPage();
   }
 
   getCardSize() { return 5; }
