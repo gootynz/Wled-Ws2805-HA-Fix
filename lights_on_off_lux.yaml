@@ -1,0 +1,95 @@
+alias: "Lights On Off Outdoor Lights Lux Value"
+id: lights_on_off_outdoor_lights_lux_value
+description: >-
+  TESTING MODE - using simulated lux slider instead of real sensor.
+  Swap sensor back to sensor.auto_lights_off_lux_value when done testing.
+triggers:
+  - trigger: time_pattern
+    minutes: "/1"
+    id: lux_check
+#  - trigger: state
+#    entity_id: input_number.auto_lights_off_lux_value
+#    entity_id: input_number.auto_lights_off_lux_simulate
+  - trigger: template
+    value_template: >
+      {% set turned_on = states('input_datetime.auto_lights_off_lights_turned_on_time') %}
+      {% set hours = states('input_select.auto_lights_off_hours_to_delay') | int %}
+      {% if turned_on not in ['unknown', 'unavailable'] %}
+        {{ (as_timestamp(now()) - as_timestamp(turned_on)) / 3600 >= hours }}
+      {% else %}
+        false
+      {% endif %}
+    id: timer_expired
+variables:
+  lux_source: "{{ states('sensor.auto_lights_off_lux_value') | float(0) }}"
+  #lux_source: "{{ states('input_number.auto_lights_off_lux_simulate') | float(0) }}"
+  active_lights: >
+    {% set lights = [] %}
+    {% if is_state('input_boolean.auto_lights_off_light_flood', 'on') %}
+      {% set lights = lights + ['light.flood_rgb_zb'] %}
+    {% endif %}
+    {% if is_state('input_boolean.auto_lights_off_light_outside', 'on') %}
+      {% set lights = lights + ['light.outside_rgb'] %}
+    {% endif %}
+    {% if is_state('input_boolean.auto_lights_off_light_tv', 'on') %}
+      {% set lights = lights + ['light.tv_rgb'] %}
+    {% endif %}
+    {% if is_state('input_boolean.auto_lights_off_light_mini', 'on') %}
+      {% set lights = lights + ['light.mini_rgb'] %}
+    {% endif %}
+    {{ lights }}
+actions:
+  - choose:
+      # LUX LOW — turn lights on
+      - conditions:
+          - condition: trigger
+            id: lux_check
+          - condition: template
+            value_template: "{{ lux_source < states('input_number.auto_lights_off_turn_on_threshold') | float(0) }}"
+          - condition: template
+            value_template: "{{ expand(active_lights) | selectattr('state', 'eq', 'off') | list | count > 0 }}"
+        sequence:
+          - action: scene.create
+            data:
+              scene_id: auto_lights_off_outdoor_scene
+              snapshot_entities: "{{ active_lights }}"
+          - action: input_datetime.set_datetime
+            target:
+              entity_id: input_datetime.auto_lights_off_lights_turned_on_time
+            data:
+              datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+          - action: light.turn_on
+            target:
+              entity_id: "{{ active_lights }}"
+            data:
+              effect: solid
+              transition: "{{ states('input_number.auto_lights_off_transition') | int }}"
+      # LUX HIGH — turn lights off and restore scene
+      - conditions:
+          - condition: trigger
+            id:
+              - lux_check
+              - timer_expired
+          - condition: template
+            value_template: "{{ lux_source > states('input_number.auto_lights_off_turn_off_threshold') | float(0) }}"
+          - condition: template
+            value_template: "{{ expand(active_lights) | selectattr('state', 'eq', 'on') | list | count > 0 }}"
+        sequence:
+          - action: light.turn_off
+            target:
+              entity_id: "{{ active_lights }}"
+            data:
+              transition: "{{ states('input_number.auto_lights_off_transition') | int }}"
+          - delay:
+              seconds: 5
+          - action: scene.turn_on
+            target:
+              entity_id: scene.auto_lights_off_outdoor_scene
+            data:
+              transition: "{{ states('input_number.auto_lights_off_transition') | int }}"
+          - action: input_datetime.set_datetime
+            target:
+              entity_id: input_datetime.auto_lights_off_lights_turned_on_time
+            data:
+              datetime: "1970-01-01 00:00:00"
+mode: restart
