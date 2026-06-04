@@ -1,5 +1,0 @@
-  auto_lights_off_lights_turned_on_time:
-    name: "Lights Turned On Delay Time "
-    has_date: true
-    has_time: true
-    icon: mdi:clock-start
