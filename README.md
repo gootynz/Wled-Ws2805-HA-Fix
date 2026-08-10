@@ -1,4 +1,4 @@
-# WLED Card for Home Assistant
+# WLED WS2805 Card for Home Assistant
 
 A custom Lovelace card built specifically for **WS2805 RGBWW LED strips** controlled via [WLED](https://kno.wled.ge/).
 
@@ -6,24 +6,38 @@ A custom Lovelace card built specifically for **WS2805 RGBWW LED strips** contro
 
 ## Why does this exist?
 
-The WS2805 is a 5-channel RGBWW LED (R, G, B, W, WW). Home Assistant's built-in light integration does not correctly handle the dedicated white channels — it guesses at the color model, mangling colors and breaking white controls entirely.
+The WS2805 is a 5-channel RGBWW LED (R, G, B, cold white, warm white). Home Assistant's built-in `wled` integration doesn't correctly expose independent control of the two white channels — under certain WLED firmware capability reporting, the light entity can drop to a CCT-only color mode and lose RGB entirely. This is a known, currently open upstream bug: [home-assistant/core#146123](https://github.com/home-assistant/core/issues/146123).
 
-This is a known, long-standing issue that remains unfixed while HA continues to ship new features. Rather than wait for a fix that may never come, this card bypasses the broken integration entirely and talks directly to WLED's REST API for effects, speed and intensity — while routing on/off, brightness and color through HA's `callService` to keep your automations working.
+This card works around it two ways:
 
-**No iframe. No popups. No scroll hijacking. No broken light entity.**
+- **`host:` mode** (direct WLED REST API, browser → WLED device) — bypasses the HA entity completely for effects, palettes, speed/intensity, and real independent cold/warm white control. This works out of the box, no HA-side patching required.
+- **`entity:` mode** — used for on/off, brightness, and state sync so your existing automations keep working. If you also want the *entity itself* to correctly report true independent CW/WW (`rgbww_color`), you'll need a patched `wled` integration — HA core's stock version doesn't do this yet. See the linked issue above for current status.
+
+You can use `host:` alone for full control without touching HA's integration at all, or combine both for entity-based automations plus full manual control.
+
+**No iframe. No popups. No scroll hijacking.**
 
 ---
 
 ## Features
 
-- On/Off toggle synced with HA state
-- Brightness slider
-- 7 quick-pick color buttons (tap to set color and power on simultaneously)
-- Configurable color preset dropdown (supports multi-color effect presets)
-- WLED effect selector (loaded directly from your WLED device)
+- On/Off toggle + brightness slider, synced with HA entity state
+- 7 quick-pick color buttons (instant color + power on)
+- Real independent cold/warm white sliders via direct WLED REST (`host:` mode)
+- **Color Palettes** — 18 curated WLED palettes, live-rendered as gradient swatches pulled directly from your WLED device (`/json/palx`), paged list, click to apply
+- WLED effect selector — loaded live from your device, not hardcoded
 - Effect speed and intensity sliders
-- Card background tints to reflect the current light color
-- Works alongside existing automations — no conflicts
+- Card background tints to reflect current light color, locked during active edits to avoid flicker/revert from background polling
+- Standalone test-harness friendly — works without a `hass` object
+
+---
+
+## Requirements
+
+- WLED **0.14+** (uses `/json/palx` for palette gradient data, added in 0.14)
+- `host:` must be reachable from your **browser**, not from HA itself:
+  - On LAN: local IP (`http://192.168.1.x`) or mDNS (`http://wled.local`)
+  - Remote access (Nabu Casa, Cloudflare Tunnel, etc.): LAN IP won't resolve externally — use a FQDN that does, or omit `host:` and run entity-only (loses effects/palettes/CW-WW control)
 
 ---
 
@@ -31,21 +45,19 @@ This is a known, long-standing issue that remains unfixed while HA continues to 
 
 1. Open HACS in Home Assistant
 2. Go to **Frontend**
-3. Click the three dots menu → **Custom repositories**
-4. Add `https://github.com/yourusername/wled-card` as a **Lovelace** repository
-5. Install **WLED Card**
-6. Refresh your browser
-
----
+3. Three-dot menu → **Custom repositories**
+4. Add `https://github.com/gootynz/Wled-Ws2805-HA-Fix` as a **Lovelace** repository
+5. Install **WLED WS2805 Card**
+6. Refresh your browser (hard refresh — HA's frontend caches JS independently of server cache headers)
 
 ## Manual Installation
 
-1. Download `wled-card.js`
-2. Copy to `/config/www/wled-card.js`
-3. In HA go to **Settings → Dashboards → Resources → Add**
-   - URL: `/local/wled-card.js`
+1. Download `wled-ws2805-card.js`
+2. Copy to `/config/www/wled-ws2805-card.js`
+3. **Settings → Dashboards → Resources → Add**
+   - URL: `/local/wled-ws2805-card.js`
    - Type: JavaScript module
-4. Reload your browser
+4. Hard refresh your browser
 
 ---
 
@@ -53,63 +65,34 @@ This is a known, long-standing issue that remains unfixed while HA continues to 
 
 ```yaml
 type: custom:wled-card
-entity: light.your_wled_light    # HA light entity (keeps automations working)
-host: http://192.168.1.13        # WLED device IP (for effects, speed, intensity)
 name: LED Strip
+entity: light.your_wled_light    # optional — on/off, brightness, automations
+host: http://192.168.1.13        # optional — required for effects/palettes/speed/intensity/CW-WW
 ```
 
-### With custom presets
+### Direct REST only, no HA entity
 
 ```yaml
 type: custom:wled-card
-entity: light.your_wled_light
-host: http://192.168.1.13
 name: LED Strip
-presets:
-  - name: Warm White
-    rgb: [255, 180, 80]
-  - name: Sunset
-    rgb: [[255,80,20], [255,180,0], [200,0,50]]   # multi-color for effects
-  - name: Red
-    rgb: [255, 0, 0]
-```
-
-### Without HA entity (direct REST only)
-
-```yaml
-type: custom:wled-card
 host: http://192.168.1.13
-name: LED Strip
 ```
 
 ---
 
-## Card Background Styles
+## Known limitations
 
-The card background tints to the current light color. Five styles are available in `wled-card.js` — comment/uncomment your preferred option in the `_setCardBg` method:
-
-| Option | Style |
-|--------|-------|
-| 1 | Subtle full card tint |
-| 2 | Strong left fade |
-| 3 | Strong right fade |
-| 4 | Right quarter color only |
-| 5 | Radial vignette glow from edges (default) |
+- `entity:`-mode CW/WW state reporting depends on HA core's `wled` integration correctly exposing `rgbww_color` — currently broken on some firmware capability configurations ([core#146123](https://github.com/home-assistant/core/issues/146123), open). `host:` mode is unaffected.
+- No `presets:` YAML override — the palette list is a fixed, curated set matched to what's commonly useful on WS2805; fork and edit the `PALETTES` array directly if you want different ones.
 
 ---
 
-## WS2805 Notes
+## Support
 
-- WLED handles the W and WW channels automatically based on your LED type configured in WLED settings
-- Just send RGB — WLED sorts the white channel
-- Warm White preset `[255, 180, 80]` approximates warm white via RGB; the actual W channel is managed by WLED
+None — provided as-is. Fork and modify for your own setup; issues/PRs welcome but no guaranteed response.
 
 ---
 
-![WLED Card](screenshots/ws2805-wled-js-standard.JPG)
-
-![WLED Card](screenshots/ws2805-wled-js-effects-active.JPG)
-
-![WLED Card](screenshots/ws2805-wled-js-bg-bottom.JPG)
 ## License
+
 MIT
